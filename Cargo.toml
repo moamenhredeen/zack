@@ -1,6 +1,8 @@
 [package]
-name = "svi"
+name = "zack"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+cursor-icon = "1.1.0"
+winit = "0.30.5"
