@@ -14,23 +14,24 @@ Most HTTP clients ship a full browser engine (Electron) just to render a form an
 ## Features
 
 - Send requests with all common methods (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`).
-- Configure query params, headers, and request bodies (JSON, form, raw, multipart).
-- Organize requests into collections and folders.
-- Environments and variables (`{{base_url}}`, `{{token}}`) with per-environment overrides.
+- Read and write OpenCollection YAML folders.
+- Configure query params, headers, and request bodies (JSON and raw text in the current UI).
+- Organize requests in collection files.
+- Environments and variables (`{{base_url}}`, `{{token}}`) with per-environment overrides (planned).
 - Response viewer: pretty-printed JSON, headers, status, timing, and size.
-- Request history.
+- Request history (planned).
 - Import/export compatible formats (planned: Postman, Bruno, OpenAPI).
 
 ## Status
 
-🚧 Early development. Core request/response flow is the current focus. Expect breaking changes.
+🚧 Early development. Zack currently opens an OpenCollection YAML folder, edits request files, sends HTTP requests, and renders responses. Expect breaking changes.
 
 ## Tech Stack
 
 - **Language:** [Rust](https://www.rust-lang.org/)
 - **UI:** [GPUI](https://www.gpui.rs/) — the GPU-accelerated UI framework from the Zed editor.
-- **HTTP:** [`reqwest`](https://crates.io/crates/reqwest) (planned)
-- **Serialization:** [`serde`](https://serde.rs/) (planned)
+- **HTTP:** [`reqwest`](https://crates.io/crates/reqwest)
+- **Serialization:** [`serde`](https://serde.rs/), `serde_yaml`, and `serde_json`
 
 ## Getting Started
 
@@ -47,6 +48,12 @@ cd zack
 cargo run
 ```
 
+By default Zack opens the bundled `sample-collection/`. To open another OpenCollection folder, set `ZACK_COLLECTION` to a directory containing `opencollection.yml`:
+
+```sh
+ZACK_COLLECTION=/path/to/collection cargo run
+```
+
 ### Release build
 
 ```sh
@@ -55,8 +62,9 @@ cargo build --release
 
 ## Roadmap
 
-- [ ] Send a request and render the response
-- [ ] Collections and folders
+- [x] Send a request and render the response
+- [x] Read/write OpenCollection request files
+- [ ] Collection and folder creation UI
 - [ ] Environments and variables
 - [ ] Request history
 - [ ] Auth helpers (Bearer, Basic, API key)
