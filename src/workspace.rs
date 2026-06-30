@@ -4,13 +4,14 @@ use std::{
 };
 
 use gpui::{
-    AppContext, Context, Corners, Entity, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    AppContext, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    relative,
 };
 use gpui_component::{
-    ActiveTheme, IconName, IndexPath, Sizable, StyledExt, blue_300,
-    button::{Button, ButtonVariants, DropdownButton},
+    ActiveTheme, IconName, IndexPath, Selectable, Sizable, StyledExt, blue_300,
+    button::{Button, ButtonGroup, ButtonVariants, DropdownButton},
+    clipboard::Clipboard,
     green_300, h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
@@ -74,6 +75,7 @@ pub struct WorkspaceScreen {
     is_dirty: bool,
     request_tab: RequestTab,
     response_tab: ResponseTab,
+    response_body_pretty: bool,
     http_client: reqwest::blocking::Client,
     method_select: Entity<SelectState<Vec<SharedString>>>,
     url_input: Entity<InputState>,
@@ -112,7 +114,8 @@ impl WorkspaceScreen {
         });
         let body_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .multi_line(true)
+                .code_editor("json")
+                .line_number(true)
                 .placeholder("{\n  \"name\": \"Ada\"\n}")
         });
 
@@ -137,6 +140,7 @@ impl WorkspaceScreen {
             is_dirty: false,
             request_tab: RequestTab::Headers,
             response_tab: ResponseTab::Body,
+            response_body_pretty: true,
             http_client: reqwest::blocking::Client::new(),
             method_select,
             url_input,
@@ -248,6 +252,7 @@ impl WorkspaceScreen {
     fn send_selected(&mut self, cx: &mut Context<Self>) {
         self.is_sending = true;
         self.response = None;
+        self.response_body_pretty = true;
         self.status_message = Some("Sending request".to_string());
         let client = self.http_client.clone();
         let draft = self.draft.clone();
@@ -367,6 +372,7 @@ impl WorkspaceScreen {
             state.set_value(format_rows(&self.draft.params), window, cx);
         });
         self.body_input.update(cx, |state, cx| {
+            state.set_highlighter(self.draft.body.language(), cx);
             state.set_value(self.draft.body.text().to_string(), window, cx);
         });
     }
@@ -439,6 +445,7 @@ impl WorkspaceScreen {
 
         v_flex()
             .flex_1()
+            .flex_basis(relative(0.))
             .min_h(px(280.))
             .border_b_1()
             .border_color(cx.theme().border)
@@ -512,6 +519,7 @@ impl WorkspaceScreen {
             .child(
                 v_flex()
                     .flex_1()
+                    .min_h(px(0.))
                     .p_3()
                     .gap_3()
                     .child(
@@ -561,6 +569,8 @@ impl WorkspaceScreen {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         v_flex()
+            .flex_1()
+            .min_h(px(0.))
             .gap_2()
             .child(
                 h_flex()
@@ -575,11 +585,9 @@ impl WorkspaceScreen {
             )
             .child(
                 div()
-                    .h(px(150.))
-                    .border_1()
-                    .rounded(cx.theme().radius)
-                    .border_color(cx.theme().input)
-                    .child(Input::new(input).appearance(false)),
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(Input::new(input).appearance(false).h_full()),
             )
             .into_any_element()
     }
@@ -591,6 +599,7 @@ impl WorkspaceScreen {
 
         v_flex()
             .flex_1()
+            .flex_basis(relative(0.))
             .min_h(px(260.))
             .child(
                 h_flex()
@@ -614,32 +623,197 @@ impl WorkspaceScreen {
                             .child(Tab::new().label("Headers"))
                             .child(Tab::new().label("Meta")),
                     )
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(status)),
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(status),
+                    ),
+            )
+            .child(div().flex_1().overflow_y_scrollbar().p_3().child(
+                match (&self.response, self.response_tab) {
+                    (Some(response), ResponseTab::Body) => self.render_response_body(response, cx),
+                    (Some(response), ResponseTab::Headers) => {
+                        self.render_response_headers(response, cx)
+                    }
+                    (Some(response), ResponseTab::Meta) => self.render_response_meta(response, cx),
+                    (None, _) => code_block("No response yet.".to_string(), cx),
+                },
+            ))
+    }
+
+    fn render_response_body(
+        &self,
+        response: &ResponseRecord,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let text = if self.response_body_pretty {
+            response.pretty_body.clone()
+        } else {
+            response.body.clone()
+        };
+        let mode = if self.response_body_pretty {
+            "Pretty"
+        } else {
+            "Raw"
+        };
+
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                ButtonGroup::new("response-body-mode")
+                                    .small()
+                                    .child(
+                                        Button::new("response-body-pretty")
+                                            .label("Pretty")
+                                            .selected(self.response_body_pretty),
+                                    )
+                                    .child(
+                                        Button::new("response-body-raw")
+                                            .label("Raw")
+                                            .selected(!self.response_body_pretty),
+                                    )
+                                    .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
+                                        this.response_body_pretty = !selected.contains(&1);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{} body, {} bytes", mode, response.size_bytes)),
+                            ),
+                    )
+                    .child(
+                        Clipboard::new("copy-response-body")
+                            .tooltip("Copy response body")
+                            .value(text.clone()),
+                    ),
+            )
+            .child(code_block(text, cx))
+            .into_any_element()
+    }
+
+    fn render_response_headers(
+        &self,
+        response: &ResponseRecord,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let header_text = format_rows(&response.headers);
+
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .child(format!("{} headers", response.headers.len())),
+                    )
+                    .child(
+                        Clipboard::new("copy-response-headers")
+                            .tooltip("Copy response headers")
+                            .value(header_text),
+                    ),
             )
             .child(
-                div()
-                    .flex_1()
-                    .overflow_y_scrollbar()
-                    .p_3()
-                    .child(match (&self.response, self.response_tab) {
-                        (Some(response), ResponseTab::Body) => code_block(response.pretty_body.clone(), cx),
-                        (Some(response), ResponseTab::Headers) => {
-                            code_block(format_rows(&response.headers), cx)
-                        }
-                        (Some(response), ResponseTab::Meta) => code_block(
-                            format!(
-                                "Status: {} {}\nDuration: {} ms\nSize: {} bytes\nRaw body bytes shown as UTF-8 lossy: {}",
-                                response.status,
-                                response.status_text,
-                                response.duration_ms(),
-                                response.size_bytes,
-                                response.body.len()
-                            ),
-                            cx,
-                        ),
-                        (None, _) => code_block("No response yet.".to_string(), cx),
-                    }),
+                v_flex()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().muted)
+                    .children(response.headers.iter().enumerate().map(|(index, row)| {
+                        h_flex()
+                            .min_h(px(34.))
+                            .items_start()
+                            .gap_3()
+                            .px_3()
+                            .py_2()
+                            .when(index + 1 < response.headers.len(), |el| {
+                                el.border_b_1().border_color(cx.theme().border)
+                            })
+                            .child(
+                                div()
+                                    .w(px(220.))
+                                    .flex_shrink_0()
+                                    .font_family(JETBRAINS_MONO)
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(row.key.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .font_family(JETBRAINS_MONO)
+                                    .text_sm()
+                                    .child(row.value.clone()),
+                            )
+                    })),
             )
+            .into_any_element()
+    }
+
+    fn render_response_meta(
+        &self,
+        response: &ResponseRecord,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let rows = [
+            (
+                "Status",
+                format!("{} {}", response.status, response.status_text),
+            ),
+            ("Duration", format!("{} ms", response.duration_ms())),
+            ("Size", format!("{} bytes", response.size_bytes)),
+            (
+                "Decoded body",
+                format!("{} UTF-8 characters", response.body.chars().count()),
+            ),
+        ];
+        let row_count = rows.len();
+
+        v_flex()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted)
+            .children(rows.into_iter().enumerate().map(|(index, (label, value))| {
+                h_flex()
+                    .min_h(px(34.))
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .when(index + 1 < row_count, |el| {
+                        el.border_b_1().border_color(cx.theme().border)
+                    })
+                    .child(
+                        div()
+                            .w(px(140.))
+                            .flex_shrink_0()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .font_family(JETBRAINS_MONO)
+                            .text_sm()
+                            .child(value),
+                    )
+            }))
+            .into_any_element()
     }
 }
 
@@ -664,6 +838,7 @@ impl Render for WorkspaceScreen {
 fn code_block(text: String, cx: &mut Context<WorkspaceScreen>) -> gpui::AnyElement {
     div()
         .w_full()
+        .min_h(px(140.))
         .p_3()
         .rounded(cx.theme().radius)
         .bg(cx.theme().muted)

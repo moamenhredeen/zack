@@ -85,6 +85,13 @@ impl BodyMode {
         }
     }
 
+    pub fn language(&self) -> &'static str {
+        match self {
+            Self::Json(_) | Self::None => "json",
+            Self::Raw(_) => "text",
+        }
+    }
+
     pub fn from_editor_text(value: String) -> Self {
         if value.trim().is_empty() {
             Self::None
