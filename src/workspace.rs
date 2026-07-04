@@ -446,7 +446,7 @@ impl WorkspaceScreen {
         v_flex()
             .flex_1()
             .flex_basis(relative(0.))
-            .min_h(px(280.))
+            .min_h(px(0.))
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
@@ -600,7 +600,7 @@ impl WorkspaceScreen {
         v_flex()
             .flex_1()
             .flex_basis(relative(0.))
-            .min_h(px(260.))
+            .min_h(px(0.))
             .child(
                 h_flex()
                     .justify_between()
@@ -630,7 +630,7 @@ impl WorkspaceScreen {
                             .child(status),
                     ),
             )
-            .child(div().flex_1().overflow_y_scrollbar().p_3().child(
+            .child(div().flex_1().child(div().size_full().p_3().child(
                 match (&self.response, self.response_tab) {
                     (Some(response), ResponseTab::Body) => self.render_response_body(response, cx),
                     (Some(response), ResponseTab::Headers) => {
@@ -639,7 +639,7 @@ impl WorkspaceScreen {
                     (Some(response), ResponseTab::Meta) => self.render_response_meta(response, cx),
                     (None, _) => code_block("No response yet.".to_string(), cx),
                 },
-            ))
+            )))
     }
 
     fn render_response_body(
@@ -652,6 +652,11 @@ impl WorkspaceScreen {
         } else {
             response.body.clone()
         };
+        let visible_text = if text.is_empty() {
+            "No response body.".to_string()
+        } else {
+            text.clone()
+        };
         let mode = if self.response_body_pretty {
             "Pretty"
         } else {
@@ -659,9 +664,12 @@ impl WorkspaceScreen {
         };
 
         v_flex()
+            .flex_1()
+            .h_full()
             .gap_2()
             .child(
                 h_flex()
+                    .flex_shrink_0()
                     .justify_between()
                     .child(
                         h_flex()
@@ -697,7 +705,14 @@ impl WorkspaceScreen {
                             .value(text.clone()),
                     ),
             )
-            .child(code_block(text, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .min_h(px(0.))
+                    .overflow_y_scrollbar()
+                    .child(code_block(visible_text, cx)),
+            )
             .into_any_element()
     }
 
@@ -709,9 +724,14 @@ impl WorkspaceScreen {
         let header_text = format_rows(&response.headers);
 
         v_flex()
+            .flex_1()
+            .h_full()
+            .min_h(px(0.))
+            .overflow_hidden()
             .gap_2()
             .child(
                 h_flex()
+                    .flex_shrink_0()
                     .justify_between()
                     .child(
                         div()
@@ -726,39 +746,47 @@ impl WorkspaceScreen {
                     ),
             )
             .child(
-                v_flex()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().muted)
-                    .children(response.headers.iter().enumerate().map(|(index, row)| {
-                        h_flex()
-                            .min_h(px(34.))
-                            .items_start()
-                            .gap_3()
-                            .px_3()
-                            .py_2()
-                            .when(index + 1 < response.headers.len(), |el| {
-                                el.border_b_1().border_color(cx.theme().border)
-                            })
-                            .child(
-                                div()
-                                    .w(px(220.))
-                                    .flex_shrink_0()
-                                    .font_family(JETBRAINS_MONO)
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(row.key.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .font_family(JETBRAINS_MONO)
-                                    .text_sm()
-                                    .child(row.value.clone()),
-                            )
-                    })),
+                div()
+                    .flex_1()
+                    .h_full()
+                    .min_h(px(0.))
+                    .overflow_y_scrollbar()
+                    .child(
+                        v_flex()
+                            .rounded(cx.theme().radius)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().muted)
+                            .children(response.headers.iter().enumerate().map(|(index, row)| {
+                                h_flex()
+                                    .min_h(px(34.))
+                                    .items_start()
+                                    .gap_3()
+                                    .px_3()
+                                    .py_2()
+                                    .when(index + 1 < response.headers.len(), |el| {
+                                        el.border_b_1().border_color(cx.theme().border)
+                                    })
+                                    .child(
+                                        div()
+                                            .w(px(220.))
+                                            .flex_shrink_0()
+                                            .font_family(JETBRAINS_MONO)
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(row.key.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .whitespace_normal()
+                                            .font_family(JETBRAINS_MONO)
+                                            .text_sm()
+                                            .child(row.value.clone()),
+                                    )
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -828,6 +856,8 @@ impl Render for WorkspaceScreen {
             .child(
                 v_flex()
                     .flex_1()
+                    .h_full()
+                    .min_h(px(0.))
                     .min_w(px(480.))
                     .child(self.render_request_editor(cx))
                     .child(self.render_response(cx)),
