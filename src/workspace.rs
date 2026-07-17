@@ -9,7 +9,7 @@ use gpui::{
     relative,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IconName, IndexPath, Selectable, Sizable, StyledExt, blue_300,
+    ActiveTheme, IconName, IndexPath, Selectable, Sizable, StyledExt, blue_300,
     button::{Button, ButtonGroup, ButtonVariants, DropdownButton},
     clipboard::Clipboard,
     green_300, h_flex,

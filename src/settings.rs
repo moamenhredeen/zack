@@ -3,8 +3,9 @@ use gpui::{
     div, px,
 };
 use gpui_component::{
-    ActiveTheme, IndexPath, Theme, ThemeMode, h_flex, v_flex,
+    ActiveTheme, IndexPath, Theme, ThemeMode, h_flex,
     select::{Select, SelectEvent, SelectState},
+    v_flex,
 };
 
 pub struct Settings {
@@ -16,9 +17,8 @@ impl Settings {
         let modes: Vec<SharedString> = vec!["Light".into(), "Dark".into()];
         let selected_index = if cx.theme().mode.is_dark() { 1 } else { 0 };
 
-        let theme_select = cx.new(|cx| {
-            SelectState::new(modes, Some(IndexPath::new(selected_index)), window, cx)
-        });
+        let theme_select =
+            cx.new(|cx| SelectState::new(modes, Some(IndexPath::new(selected_index)), window, cx));
 
         cx.subscribe_in(&theme_select, window, Self::on_theme_select)
             .detach();
@@ -45,7 +45,7 @@ impl Settings {
 }
 
 impl Render for Settings {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .justify_center()
             .items_center()
@@ -53,15 +53,11 @@ impl Render for Settings {
             .gap_3()
             .child("Settings")
             .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child("Theme")
-                    .child(
-                        div()
-                            .w(px(160.))
-                            .child(Select::new(&self.theme_select).placeholder("Theme")),
-                    ),
+                h_flex().gap_2().items_center().child("Theme").child(
+                    div()
+                        .w(px(160.))
+                        .child(Select::new(&self.theme_select).placeholder("Theme")),
+                ),
             )
     }
 }
