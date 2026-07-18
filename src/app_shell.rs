@@ -1,3 +1,4 @@
+use crate::collection::CollectionStore;
 use crate::fonts::JETBRAINS_MONO;
 use crate::settings::Settings;
 use crate::workspace::WorkspaceScreen;
@@ -14,15 +15,18 @@ enum Page {
 
 pub struct AppShell {
     active_page: Page,
+    collections: Entity<CollectionStore>,
     workspace: Entity<WorkspaceScreen>,
     settings: Entity<Settings>,
 }
 
 impl AppShell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let collections = cx.new(|_| CollectionStore::new());
         Self {
             active_page: Page::Collection,
-            workspace: cx.new(|cx| WorkspaceScreen::new(window, cx)),
+            workspace: cx.new(|cx| WorkspaceScreen::new(collections.clone(), window, cx)),
+            collections,
             settings: cx.new(|cx| Settings::new(window, cx)),
         }
     }

@@ -8234,6 +8234,7 @@ name = "zack"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "gpui",
  "gpui-component",
  "gpui-component-assets",

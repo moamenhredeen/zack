@@ -6,37 +6,11 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
+use crate::collection::Request;
 use crate::model::{BodyMode, KeyValueRow, RequestDraft};
 
-#[derive(Clone, Debug)]
-pub struct LoadedCollection {
-    pub root: PathBuf,
-    pub name: String,
-    pub requests: Vec<LoadedRequest>,
-}
-
-#[derive(Clone, Debug)]
-pub struct LoadedRequest {
-    pub path: PathBuf,
-    pub relative_path: PathBuf,
-    pub draft: RequestDraft,
-    pub raw: Value,
-    pub parse_error: Option<String>,
-}
-
-impl LoadedCollection {
-    pub fn selected_request(&self, path: &Path) -> Option<&LoadedRequest> {
-        self.requests.iter().find(|request| request.path == path)
-    }
-
-    pub fn selected_request_mut(&mut self, path: &Path) -> Option<&mut LoadedRequest> {
-        self.requests
-            .iter_mut()
-            .find(|request| request.path == path)
-    }
-}
-
-pub fn load_collection(root: impl AsRef<Path>) -> Result<LoadedCollection> {
+/// Reads a collection directory, returning its name and requests.
+pub fn load(root: impl AsRef<Path>) -> Result<(String, Vec<Request>)> {
     let root = root.as_ref().to_path_buf();
     let collection_file = root.join("opencollection.yml");
     let collection_value = read_yaml_value(&collection_file)
@@ -54,14 +28,10 @@ pub fn load_collection(root: impl AsRef<Path>) -> Result<LoadedCollection> {
     collect_requests(&root, &root, &mut requests)?;
     requests.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
-    Ok(LoadedCollection {
-        root,
-        name,
-        requests,
-    })
+    Ok((name, requests))
 }
 
-pub fn save_request(request: &mut LoadedRequest) -> Result<()> {
+pub fn save_request(request: &mut Request) -> Result<()> {
     write_draft_to_value(&mut request.raw, &request.draft);
     let serialized = serde_yaml::to_string(&request.raw)?;
     fs::write(&request.path, serialized)
@@ -69,7 +39,7 @@ pub fn save_request(request: &mut LoadedRequest) -> Result<()> {
     Ok(())
 }
 
-pub fn create_request(root: &Path, name: &str) -> Result<LoadedRequest> {
+pub fn create_request(root: &Path, name: &str) -> Result<Request> {
     let file_name = slugify(name);
     let path = unique_request_path(root, &file_name);
     let draft = RequestDraft {
@@ -78,7 +48,7 @@ pub fn create_request(root: &Path, name: &str) -> Result<LoadedRequest> {
     };
     let mut raw = Value::Mapping(Mapping::new());
     write_draft_to_value(&mut raw, &draft);
-    let mut request = LoadedRequest {
+    let mut request = Request {
         path: path.clone(),
         relative_path: path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
         draft,
@@ -89,7 +59,7 @@ pub fn create_request(root: &Path, name: &str) -> Result<LoadedRequest> {
     Ok(request)
 }
 
-fn collect_requests(root: &Path, dir: &Path, requests: &mut Vec<LoadedRequest>) -> Result<()> {
+fn collect_requests(root: &Path, dir: &Path, requests: &mut Vec<Request>) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
@@ -114,7 +84,7 @@ fn collect_requests(root: &Path, dir: &Path, requests: &mut Vec<LoadedRequest>) 
         let loaded = match read_yaml_value(&path) {
             Ok(raw) => {
                 let draft = draft_from_value(&raw, &path);
-                LoadedRequest {
+                Request {
                     path,
                     relative_path,
                     draft,
@@ -122,7 +92,7 @@ fn collect_requests(root: &Path, dir: &Path, requests: &mut Vec<LoadedRequest>) 
                     parse_error: None,
                 }
             }
-            Err(error) => LoadedRequest {
+            Err(error) => Request {
                 path,
                 relative_path,
                 draft: RequestDraft::default(),
@@ -379,6 +349,24 @@ pub fn ensure_collection_root(root: &Path) -> Result<()> {
             root.display()
         ));
     }
+    Ok(())
+}
+
+/// Creates `root` as an empty collection if it is not one already.
+pub fn init_collection_root(root: &Path, name: &str) -> Result<()> {
+    if ensure_collection_root(root).is_ok() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(root)
+        .with_context(|| format!("failed to create {}", root.display()))?;
+
+    let mut value = Value::Mapping(Mapping::new());
+    set_string(&mut value, &["info", "name"], name);
+    let serialized = serde_yaml::to_string(&value)?;
+    let manifest = root.join("opencollection.yml");
+    fs::write(&manifest, serialized)
+        .with_context(|| format!("failed to write {}", manifest.display()))?;
     Ok(())
 }
 

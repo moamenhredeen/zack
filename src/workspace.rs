@@ -1,5 +1,5 @@
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -25,10 +25,10 @@ use gpui_component::{
 };
 
 use crate::{
+    collection::{CollectionEvent, CollectionStore},
     fonts::JETBRAINS_MONO,
     http_client,
     model::{BodyMode, HttpMethod, KeyValueRow, RequestDraft, ResponseRecord},
-    opencollection::{self, LoadedCollection},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,8 +66,7 @@ impl ResponseTab {
 }
 
 pub struct WorkspaceScreen {
-    collection: Option<LoadedCollection>,
-    selected_path: Option<PathBuf>,
+    collections: Entity<CollectionStore>,
     draft: RequestDraft,
     response: Option<ResponseRecord>,
     status_message: Option<String>,
@@ -85,7 +84,11 @@ pub struct WorkspaceScreen {
 }
 
 impl WorkspaceScreen {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        collections: Entity<CollectionStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let method_select = cx.new(|cx| {
             SelectState::new(
                 HttpMethod::ALL
@@ -130,9 +133,11 @@ impl WorkspaceScreen {
         cx.subscribe_in(&body_input, window, Self::on_body_input)
             .detach();
 
+        cx.subscribe_in(&collections, window, Self::on_collection_event)
+            .detach();
+
         let mut this = Self {
-            collection: None,
-            selected_path: None,
+            collections,
             draft: RequestDraft::default(),
             response: None,
             status_message: None,
@@ -149,98 +154,84 @@ impl WorkspaceScreen {
             body_input,
         };
 
-        let default_path = default_collection_path();
-        this.load_collection(default_path, window, cx);
+        this.load_selected_draft(window, cx);
         this
     }
 
-    fn load_collection(
+    fn on_collection_event(
         &mut self,
-        root: impl AsRef<Path>,
+        _: &Entity<CollectionStore>,
+        event: &CollectionEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match opencollection::ensure_collection_root(root.as_ref())
-            .and_then(|_| opencollection::load_collection(root.as_ref()))
-        {
-            Ok(collection) => {
-                self.selected_path = collection
-                    .requests
-                    .first()
-                    .map(|request| request.path.clone());
-                self.collection = Some(collection);
+        match event {
+            CollectionEvent::ActiveChanged => {
+                self.response = None;
                 self.load_selected_draft(window, cx);
-                self.status_message = Some("Loaded OpenCollection sample".to_string());
             }
-            Err(error) => {
-                self.collection = None;
-                self.selected_path = None;
-                self.status_message = Some(error.to_string());
-                self.sync_inputs_from_draft(window, cx);
-            }
+            CollectionEvent::RequestsChanged => self.load_selected_draft(window, cx),
         }
         cx.notify();
     }
 
+    fn switch_collection(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.is_dirty {
+            let _ = self.save_selected(cx);
+        }
+        self.collections.update(cx, |store, cx| {
+            store.set_active(index);
+            cx.emit(CollectionEvent::ActiveChanged);
+        });
+    }
+
     fn select_request(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_dirty {
-            let _ = self.save_selected();
+            let _ = self.save_selected(cx);
         }
-        self.selected_path = Some(path);
+        self.collections.update(cx, |store, _| {
+            store.active_mut().select(path);
+        });
         self.response = None;
         self.load_selected_draft(window, cx);
         cx.notify();
     }
 
     fn load_selected_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let (Some(collection), Some(path)) = (&self.collection, &self.selected_path)
-            && let Some(request) = collection.selected_request(path)
-        {
-            self.draft = request.draft.clone();
-            self.status_message = request.parse_error.clone();
-            self.is_dirty = false;
-            self.sync_inputs_from_draft(window, cx);
-            return;
-        }
+        let selected = self
+            .collections
+            .read(cx)
+            .active()
+            .selected_request()
+            .map(|request| (request.draft.clone(), request.parse_error.clone()));
 
-        self.draft = RequestDraft::default();
+        match selected {
+            Some((draft, parse_error)) => {
+                self.draft = draft;
+                self.status_message = parse_error;
+            }
+            None => self.draft = RequestDraft::default(),
+        }
         self.is_dirty = false;
         self.sync_inputs_from_draft(window, cx);
     }
 
-    fn save_selected(&mut self) -> anyhow::Result<()> {
-        let collection = self
-            .collection
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("No collection is loaded"))?;
-        let path = self
-            .selected_path
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("No request is selected"))?;
-        let request = collection
-            .selected_request_mut(&path)
-            .ok_or_else(|| anyhow::anyhow!("Selected request is not in the collection"))?;
-        request.draft = self.draft.clone();
-        opencollection::save_request(request)?;
+    fn save_selected(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        let draft = self.draft.clone();
+        self.collections
+            .update(cx, |store, _| store.active_mut().save_selected(&draft))?;
         self.is_dirty = false;
         self.status_message = Some("Saved request".to_string());
         Ok(())
     }
 
     fn create_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(collection) = self.collection.as_mut() else {
-            self.status_message = Some("Load a collection before creating requests".to_string());
-            cx.notify();
-            return;
-        };
+        let created = self
+            .collections
+            .update(cx, |store, _| store.active_mut().create_request("New request"));
 
-        match opencollection::create_request(&collection.root, "New request") {
-            Ok(request) => {
-                self.selected_path = Some(request.path.clone());
-                collection.requests.push(request);
-                collection
-                    .requests
-                    .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        match created {
+            Ok(_) => {
                 self.load_selected_draft(window, cx);
                 self.status_message = Some("Created request".to_string());
             }
@@ -378,11 +369,29 @@ impl WorkspaceScreen {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl gpui::IntoElement {
-        let collection_name = self
-            .collection
-            .as_ref()
-            .map(|collection| collection.name.clone())
-            .unwrap_or_else(|| "No collection".to_string());
+        let store = self.collections.read(cx);
+        let active_index = store.active_index();
+        let collection_name = store.active().name.clone();
+        let switcher_items = store
+            .collections()
+            .iter()
+            .enumerate()
+            .map(|(index, collection)| (index, collection.name.clone()))
+            .collect::<Vec<_>>();
+        let requests = store
+            .active()
+            .requests
+            .iter()
+            .map(|request| {
+                (
+                    request.path.clone(),
+                    request.relative_path.clone(),
+                    request.draft.name.clone(),
+                    request.draft.method,
+                )
+            })
+            .collect::<Vec<_>>();
+        let selected_path = store.active().selected.clone();
 
         v_flex()
             .w(px(280.))
@@ -397,10 +406,35 @@ impl WorkspaceScreen {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(div().font_semibold().child(collection_name)),
+                        v_flex().flex_1().min_w(px(0.)).child(
+                            DropdownButton::new("collection-switcher")
+                                .small()
+                                .ghost()
+                                .button(
+                                    Button::new("collection-name")
+                                        .label(collection_name)
+                                        .font_semibold(),
+                                )
+                                .dropdown_menu({
+                                    let switch_target = cx.entity();
+                                    move |mut menu, _, _| {
+                                        menu = menu.label("Collections").separator();
+                                        for (index, name) in switcher_items.clone() {
+                                            let switch_target = switch_target.clone();
+                                            menu = menu.item(
+                                                PopupMenuItem::new(name)
+                                                    .checked(index == active_index)
+                                                    .on_click(move |_, _, cx| {
+                                                        switch_target.update(cx, |this, cx| {
+                                                            this.switch_collection(index, cx);
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        menu
+                                    }
+                                }),
+                        ),
                     )
                     .child(
                         Button::new("new-request")
@@ -414,28 +448,24 @@ impl WorkspaceScreen {
                     ),
             )
             .child(v_flex().flex_1().overflow_y_scrollbar().p_2().children(
-                self.collection.as_ref().into_iter().flat_map(|collection| {
-                    collection.requests.iter().map(|request| {
-                        let selected = Some(&request.path) == self.selected_path.as_ref();
-                        let path = request.path.clone();
-                        let method = request.draft.method.to_string();
+                requests.into_iter().map(|(path, relative_path, name, method)| {
+                    let selected = Some(&path) == selected_path.as_ref();
 
-                        h_flex()
-                            .id(format!("request-{}", request.relative_path.display()))
-                            .px_2()
-                            .py_1()
-                            .justify_between()
-                            .rounded_sm()
-                            .when(selected, |el| el.bg(cx.theme().button_active))
-                            .hover(|style| style.bg(cx.theme().button_hover))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_request(path.clone(), window, cx);
-                            }))
-                            .child(request.draft.name.clone())
-                            .child(
-                                Label::new(method).text_color(method_color(&request.draft.method)),
-                            )
-                    })
+                    h_flex()
+                        .id(format!("request-{}", relative_path.display()))
+                        .px_2()
+                        .py_1()
+                        .justify_between()
+                        .rounded_sm()
+                        .when(selected, |el| el.bg(cx.theme().button_active))
+                        .hover(|style| style.bg(cx.theme().button_hover))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_request(path.clone(), window, cx);
+                        }))
+                        .child(name)
+                        .child(
+                            Label::new(method.to_string()).text_color(method_color(&method)),
+                        )
                 }),
             ))
     }
@@ -497,7 +527,7 @@ impl WorkspaceScreen {
                                                         let _ =
                                                             save_target.update(cx, |this, cx| {
                                                                 if let Err(error) =
-                                                                    this.save_selected()
+                                                                    this.save_selected(cx)
                                                                 {
                                                                     this.status_message =
                                                                         Some(error.to_string());
@@ -914,12 +944,6 @@ fn format_rows(rows: &[KeyValueRow]) -> String {
         .map(|row| format!("{}: {}", row.key, row.value))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn default_collection_path() -> PathBuf {
-    std::env::var_os("ZACK_COLLECTION")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sample-collection"))
 }
 
 #[allow(dead_code)]

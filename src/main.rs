@@ -1,4 +1,5 @@
 mod app_shell;
+mod collection;
 mod fonts;
 mod http_client;
 mod model;
