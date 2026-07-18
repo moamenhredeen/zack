@@ -1,9 +1,8 @@
 mod app_shell;
-mod collection;
+mod collection_store;
 mod fonts;
 mod http_client;
 mod model;
-mod opencollection;
 mod settings;
 mod workspace;
 

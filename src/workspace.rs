@@ -1,12 +1,9 @@
-use std::{
-    path::PathBuf,
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 
 use gpui::{
-    AppContext, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
-    relative,
+    AppContext, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement,
+    PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px, relative,
 };
 use gpui_component::{
     ActiveTheme, IconName, IndexPath, Selectable, Sizable, StyledExt, blue_300,
@@ -25,7 +22,7 @@ use gpui_component::{
 };
 
 use crate::{
-    collection::{CollectionEvent, CollectionStore},
+    collection_store::{CollectionEvent, CollectionStore},
     fonts::JETBRAINS_MONO,
     http_client,
     model::{BodyMode, HttpMethod, KeyValueRow, RequestDraft, ResponseRecord},
@@ -185,6 +182,68 @@ impl WorkspaceScreen {
         });
     }
 
+    /// Asks for a location, then creates a collection directory there.
+    fn create_collection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_new_path(&picker_start_dir(), Some("my-collection"));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(root))) = receiver.await else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.is_dirty {
+                    let _ = this.save_selected(cx);
+                }
+                let result = this.collections.update(cx, |store, _| store.create(&root));
+                this.after_collection_change(result, "Created collection", window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Asks for an existing collection directory and opens it.
+    fn open_collection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(roots))) = receiver.await else {
+                return;
+            };
+            let Some(root) = roots.into_iter().next() else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.is_dirty {
+                    let _ = this.save_selected(cx);
+                }
+                let result = this.collections.update(cx, |store, _| store.open(&root));
+                this.after_collection_change(result, "Opened collection", window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn after_collection_change(
+        &mut self,
+        result: anyhow::Result<()>,
+        success_message: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.response = None;
+                self.load_selected_draft(window, cx);
+                self.status_message = Some(success_message.to_string());
+            }
+            Err(error) => self.status_message = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
     fn select_request(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_dirty {
             let _ = self.save_selected(cx);
@@ -226,9 +285,9 @@ impl WorkspaceScreen {
     }
 
     fn create_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let created = self
-            .collections
-            .update(cx, |store, _| store.active_mut().create_request("New request"));
+        let created = self.collections.update(cx, |store, _| {
+            store.active_mut().create_request("New request")
+        });
 
         match created {
             Ok(_) => {
@@ -431,7 +490,25 @@ impl WorkspaceScreen {
                                                     }),
                                             );
                                         }
-                                        menu
+                                        menu.separator()
+                                            .item(PopupMenuItem::new("New collection…").on_click({
+                                                let target = switch_target.clone();
+                                                move |_, window, cx| {
+                                                    target.update(cx, |this, cx| {
+                                                        this.create_collection(window, cx);
+                                                    });
+                                                }
+                                            }))
+                                            .item(PopupMenuItem::new("Open collection…").on_click(
+                                                {
+                                                    let target = switch_target.clone();
+                                                    move |_, window, cx| {
+                                                        target.update(cx, |this, cx| {
+                                                            this.open_collection(window, cx);
+                                                        });
+                                                    }
+                                                },
+                                            ))
                                     }
                                 }),
                         ),
@@ -447,27 +524,36 @@ impl WorkspaceScreen {
                             })),
                     ),
             )
-            .child(v_flex().flex_1().overflow_y_scrollbar().p_2().children(
-                requests.into_iter().map(|(path, relative_path, name, method)| {
-                    let selected = Some(&path) == selected_path.as_ref();
+            .child(
+                v_flex()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .p_2()
+                    .children(
+                        requests
+                            .into_iter()
+                            .map(|(path, relative_path, name, method)| {
+                                let selected = Some(&path) == selected_path.as_ref();
 
-                    h_flex()
-                        .id(format!("request-{}", relative_path.display()))
-                        .px_2()
-                        .py_1()
-                        .justify_between()
-                        .rounded_sm()
-                        .when(selected, |el| el.bg(cx.theme().button_active))
-                        .hover(|style| style.bg(cx.theme().button_hover))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.select_request(path.clone(), window, cx);
-                        }))
-                        .child(name)
-                        .child(
-                            Label::new(method.to_string()).text_color(method_color(&method)),
-                        )
-                }),
-            ))
+                                h_flex()
+                                    .id(format!("request-{}", relative_path.display()))
+                                    .px_2()
+                                    .py_1()
+                                    .justify_between()
+                                    .rounded_sm()
+                                    .when(selected, |el| el.bg(cx.theme().button_active))
+                                    .hover(|style| style.bg(cx.theme().button_hover))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.select_request(path.clone(), window, cx);
+                                    }))
+                                    .child(name)
+                                    .child(
+                                        Label::new(method.to_string())
+                                            .text_color(method_color(&method)),
+                                    )
+                            }),
+                    ),
+            )
     }
 
     fn render_request_editor(&self, cx: &mut Context<Self>) -> impl gpui::IntoElement {
@@ -949,4 +1035,11 @@ fn format_rows(rows: &[KeyValueRow]) -> String {
 #[allow(dead_code)]
 fn _duration_for_tests() -> Duration {
     Duration::from_millis(0)
+}
+
+/// Where the native file picker opens by default.
+fn picker_start_dir() -> PathBuf {
+    dirs::document_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
 }

@@ -1,4 +1,4 @@
-use crate::collection::CollectionStore;
+use crate::collection_store::CollectionStore;
 use crate::fonts::JETBRAINS_MONO;
 use crate::settings::Settings;
 use crate::workspace::WorkspaceScreen;
