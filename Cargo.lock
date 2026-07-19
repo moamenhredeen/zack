@@ -4382,7 +4382,9 @@ dependencies = [
 
 [[package]]
 name = "opencollection"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e50dfe6af5986751616dd3f2abc1b520b468ad77342cf004e3ffb96b6173537c"
 dependencies = [
  "serde",
  "serde_yaml_ng",

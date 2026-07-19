@@ -1,54 +1,54 @@
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
+use opencollection::{
+    HttpBodyOrVariants, HttpRequest, HttpRequestBody, HttpRequestHeader, HttpRequestParam,
+    HttpResponseHeader, ParamType,
+};
 use reqwest::{
-    blocking::Client,
+    blocking::{Client, RequestBuilder},
     header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
 
-use crate::model::{BodyMode, HttpMethod, KeyValueRow, RequestDraft, ResponseRecord};
+use crate::model::ResponseRecord;
 
-pub fn send_request(client: Client, draft: RequestDraft) -> Result<ResponseRecord> {
-    let method = match draft.method {
-        HttpMethod::Get => reqwest::Method::GET,
-        HttpMethod::Post => reqwest::Method::POST,
-        HttpMethod::Put => reqwest::Method::PUT,
-        HttpMethod::Patch => reqwest::Method::PATCH,
-        HttpMethod::Delete => reqwest::Method::DELETE,
-        HttpMethod::Head => reqwest::Method::HEAD,
-        HttpMethod::Options => reqwest::Method::OPTIONS,
-    };
+pub fn send_request(client: Client, request: HttpRequest) -> Result<ResponseRecord> {
+    let details = request
+        .http
+        .as_ref()
+        .ok_or_else(|| anyhow!("request has no http details"))?;
 
-    if draft.url.trim().is_empty() {
+    let method = details.method.as_deref().unwrap_or("GET").trim();
+    let method = reqwest::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+        .map_err(|_| anyhow!("`{method}` is not a valid HTTP method"))?;
+
+    let url = details.url.as_deref().unwrap_or("").trim();
+    if url.is_empty() {
         return Err(anyhow!("URL is required"));
     }
 
-    let mut builder = client.request(method, draft.url.trim());
-    let headers = request_headers(&draft.headers)?;
+    let params = details.params.as_deref().unwrap_or_default();
+    let url = substitute_path_params(url, params);
+
+    let mut builder = client.request(method, url);
+
+    let headers = request_headers(details.headers.as_deref().unwrap_or_default())?;
     if !headers.is_empty() {
         builder = builder.headers(headers);
     }
 
-    let params: Vec<_> = draft
-        .params
+    let query: Vec<_> = params
         .iter()
-        .filter(|row| row.enabled && !row.key.trim().is_empty())
-        .map(|row| (row.key.as_str(), row.value.as_str()))
+        .filter(|param| is_enabled(param.disabled) && param.param_type == ParamType::Query)
+        .filter(|param| !param.name.trim().is_empty())
+        .map(|param| (param.name.as_str(), param.value.as_str()))
         .collect();
-    if !params.is_empty() {
-        builder = builder.query(&params);
+    if !query.is_empty() {
+        builder = builder.query(&query);
     }
 
-    match &draft.body {
-        BodyMode::None => {}
-        BodyMode::Json(body) => {
-            builder = builder
-                .header(CONTENT_TYPE, "application/json")
-                .body(body.clone());
-        }
-        BodyMode::Raw(body) => {
-            builder = builder.body(body.clone());
-        }
+    if let Some(body) = details.body.as_ref().and_then(selected_body) {
+        builder = apply_body(builder, body)?;
     }
 
     let started = Instant::now();
@@ -79,28 +79,87 @@ pub fn send_request(client: Client, draft: RequestDraft) -> Result<ResponseRecor
     })
 }
 
-fn request_headers(rows: &[KeyValueRow]) -> Result<HeaderMap> {
-    let mut headers = HeaderMap::new();
-    for row in rows {
-        if !row.enabled || row.key.trim().is_empty() {
-            continue;
-        }
-        let name = HeaderName::from_bytes(row.key.trim().as_bytes())?;
-        let value = HeaderValue::from_str(row.value.trim())?;
-        headers.insert(name, value);
+/// The body to send when a request carries several named variants.
+///
+/// Falls back to the first variant when none is marked selected, so a request
+/// with variants always sends something rather than nothing.
+pub fn selected_body(body: &HttpBodyOrVariants) -> Option<&HttpRequestBody> {
+    match body {
+        HttpBodyOrVariants::Body(body) => Some(body),
+        HttpBodyOrVariants::Variants(variants) => variants
+            .iter()
+            .find(|variant| variant.selected == Some(true))
+            .or_else(|| variants.first())
+            .map(|variant| &variant.body),
     }
-    Ok(headers)
 }
 
-fn response_headers(headers: &HeaderMap) -> Vec<KeyValueRow> {
+fn apply_body(builder: RequestBuilder, body: &HttpRequestBody) -> Result<RequestBuilder> {
+    let (content_type, data) = match body {
+        HttpRequestBody::Json { data } => ("application/json", data),
+        HttpRequestBody::Text { data } => ("text/plain", data),
+        HttpRequestBody::Xml { data } => ("application/xml", data),
+        HttpRequestBody::Sparql { data } => ("application/sparql-query", data),
+        HttpRequestBody::FormUrlEncoded { data } => {
+            let fields: Vec<_> = data
+                .iter()
+                .filter(|field| is_enabled(field.disabled))
+                .map(|field| (field.name.as_str(), field.value.as_str()))
+                .collect();
+            return Ok(builder.form(&fields));
+        }
+        HttpRequestBody::MultipartForm { .. } => {
+            return Err(anyhow!("multipart bodies are not supported yet"));
+        }
+        HttpRequestBody::File { .. } => {
+            return Err(anyhow!("file bodies are not supported yet"));
+        }
+    };
+
+    if data.trim().is_empty() {
+        return Ok(builder);
+    }
+    Ok(builder
+        .header(CONTENT_TYPE, content_type)
+        .body(data.clone()))
+}
+
+/// Fills `:name` and `{name}` placeholders from the request's path params.
+fn substitute_path_params(url: &str, params: &[HttpRequestParam]) -> String {
+    params
+        .iter()
+        .filter(|param| is_enabled(param.disabled) && param.param_type == ParamType::Path)
+        .fold(url.to_string(), |url, param| {
+            url.replace(&format!(":{}", param.name), &param.value)
+                .replace(&format!("{{{}}}", param.name), &param.value)
+        })
+}
+
+fn request_headers(headers: &[HttpRequestHeader]) -> Result<HeaderMap> {
+    let mut map = HeaderMap::new();
+    for header in headers {
+        if !is_enabled(header.disabled) || header.name.trim().is_empty() {
+            continue;
+        }
+        let name = HeaderName::from_bytes(header.name.trim().as_bytes())?;
+        let value = HeaderValue::from_str(header.value.trim())?;
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
+fn response_headers(headers: &HeaderMap) -> Vec<HttpResponseHeader> {
     headers
         .iter()
-        .map(|(key, value)| KeyValueRow {
-            enabled: true,
-            key: key.to_string(),
+        .map(|(name, value)| HttpResponseHeader {
+            name: name.to_string(),
             value: value.to_str().unwrap_or("<binary>").to_string(),
         })
         .collect()
+}
+
+fn is_enabled(disabled: Option<bool>) -> bool {
+    disabled != Some(true)
 }
 
 fn pretty_body(body: &str, content_type: &str) -> String {

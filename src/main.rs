@@ -3,6 +3,7 @@ mod collection_store;
 mod fonts;
 mod http_client;
 mod model;
+mod request_tab;
 mod settings;
 mod workspace;
 

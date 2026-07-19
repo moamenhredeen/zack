@@ -1,83 +1,36 @@
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
+use anyhow::{Result, anyhow};
 use gpui::{
     AppContext, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement,
     PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, relative,
 };
 use gpui_component::{
-    ActiveTheme, IconName, IndexPath, Selectable, Sizable, StyledExt, blue_300,
-    button::{Button, ButtonGroup, ButtonVariants, DropdownButton},
-    clipboard::Clipboard,
-    green_300, h_flex,
-    input::{Input, InputEvent, InputState},
-    label::Label,
-    menu::PopupMenuItem,
-    orange_300, red_300,
-    scroll::ScrollableElement,
-    select::{Select, SelectEvent, SelectState},
-    separator::Separator,
-    tab::{Tab, TabBar},
-    v_flex,
+    ActiveTheme, Edges, IconName, Selectable, Sizable, StyledExt, blue_300, button::{Button, ButtonGroup, ButtonVariants, DropdownButton}, clipboard::Clipboard, green_300, h_flex, input::Input, label::Label, menu::PopupMenuItem, orange_300, red_300, scroll::ScrollableElement, select::Select, separator::Separator, tab::{Tab, TabBar}, v_flex,
 };
+
+use opencollection::{HttpRequest, HttpResponseHeader};
 
 use crate::{
-    collection_store::{CollectionEvent, CollectionStore},
+    collection_store::{CollectionEvent, CollectionStore, ItemPath},
     fonts::JETBRAINS_MONO,
     http_client,
-    model::{BodyMode, HttpMethod, KeyValueRow, RequestDraft, ResponseRecord},
+    model::ResponseRecord,
+    request_tab::{RequestPane, RequestTab, ResponsePane, TabDirtied, TabTarget, join_lines},
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RequestTab {
-    Headers,
-    Params,
-    Body,
-}
-
-impl RequestTab {
-    fn index(self) -> usize {
-        match self {
-            Self::Headers => 0,
-            Self::Params => 1,
-            Self::Body => 2,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResponseTab {
-    Body,
-    Headers,
-    Meta,
-}
-
-impl ResponseTab {
-    fn index(self) -> usize {
-        match self {
-            Self::Body => 0,
-            Self::Headers => 1,
-            Self::Meta => 2,
-        }
-    }
-}
 
 pub struct WorkspaceScreen {
     collections: Entity<CollectionStore>,
-    draft: RequestDraft,
-    response: Option<ResponseRecord>,
+    /// The open tabs, each holding its own draft.
+    ///
+    /// Because a tab owns the editors it is being edited in, switching tabs —
+    /// or collections — no longer has to flush anything to disk: an unsaved
+    /// draft simply stays in the tab it belongs to.
+    tabs: Vec<Entity<RequestTab>>,
+    active: Option<usize>,
     status_message: Option<String>,
-    is_sending: bool,
-    is_dirty: bool,
-    request_tab: RequestTab,
-    response_tab: ResponseTab,
-    response_body_pretty: bool,
     http_client: reqwest::blocking::Client,
-    method_select: Entity<SelectState<Vec<SharedString>>>,
-    url_input: Entity<InputState>,
-    headers_input: Entity<InputState>,
-    params_input: Entity<InputState>,
-    body_input: Entity<InputState>,
 }
 
 impl WorkspaceScreen {
@@ -86,100 +39,176 @@ impl WorkspaceScreen {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let method_select = cx.new(|cx| {
-            SelectState::new(
-                HttpMethod::ALL
-                    .into_iter()
-                    .map(|method| SharedString::from(method.as_str()))
-                    .collect::<Vec<_>>(),
-                Some(IndexPath::default()),
-                window,
-                cx,
-            )
-        });
-        let url_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("https://api.example.com/users")
-                .default_value("https://httpbin.org/get")
-        });
-        let headers_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .placeholder("Accept: application/json")
-        });
-        let params_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .placeholder("page: 1")
-        });
-        let body_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("json")
-                .line_number(true)
-                .placeholder("{\n  \"name\": \"Ada\"\n}")
-        });
-
-        cx.subscribe_in(&url_input, window, Self::on_url_input)
-            .detach();
-        cx.subscribe_in(&method_select, window, Self::on_method_select)
-            .detach();
-        cx.subscribe_in(&headers_input, window, Self::on_headers_input)
-            .detach();
-        cx.subscribe_in(&params_input, window, Self::on_params_input)
-            .detach();
-        cx.subscribe_in(&body_input, window, Self::on_body_input)
-            .detach();
-
         cx.subscribe_in(&collections, window, Self::on_collection_event)
             .detach();
 
         let mut this = Self {
             collections,
-            draft: RequestDraft::default(),
-            response: None,
+            tabs: Vec::new(),
+            active: None,
             status_message: None,
-            is_sending: false,
-            is_dirty: false,
-            request_tab: RequestTab::Headers,
-            response_tab: ResponseTab::Body,
-            response_body_pretty: true,
             http_client: reqwest::blocking::Client::new(),
-            method_select,
-            url_input,
-            headers_input,
-            params_input,
-            body_input,
         };
 
-        this.load_selected_draft(window, cx);
+        if let Some(target) = this.selected_target(cx) {
+            this.open_tab(target, window, cx);
+        }
         this
+    }
+
+    fn active_tab(&self) -> Option<&Entity<RequestTab>> {
+        self.tabs.get(self.active?)
+    }
+
+    /// The request highlighted in the sidebar, as a tab target.
+    fn selected_target(&self, cx: &mut Context<Self>) -> Option<TabTarget> {
+        let store = self.collections.read(cx);
+        Some(TabTarget {
+            collection: store.active_index(),
+            item: store.active().selected.clone()?,
+        })
+    }
+
+    /// Focuses the tab editing `target`, opening one if it is not already open.
+    fn open_tab(&mut self, target: TabTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.read(cx).target == target)
+        {
+            self.activate_tab(index, cx);
+            return;
+        }
+
+        let Some((title, saved)) = self
+            .collections
+            .read(cx)
+            .collection(target.collection)
+            .and_then(|collection| collection.request_at(&target.item))
+            .map(|request| {
+                (
+                    request_name(request),
+                    request.http.clone().unwrap_or_default(),
+                )
+            })
+        else {
+            return;
+        };
+
+        let tab = cx.new(|cx| RequestTab::new(target, title, saved, window, cx));
+        // A tab going dirty changes the tab bar, which the workspace draws.
+        cx.subscribe(&tab, |_, _, _: &TabDirtied, cx| cx.notify())
+            .detach();
+        cx.observe(&tab, |_, _, cx| cx.notify()).detach();
+
+        self.tabs.push(tab);
+        self.activate_tab(self.tabs.len() - 1, cx);
+    }
+
+    /// Makes `index` the visible tab, following the sidebar to its collection.
+    fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        self.active = Some(index);
+
+        let target = tab.read(cx).target.clone();
+        self.collections.update(cx, |store, _| {
+            store.set_active(target.collection);
+            store.active_mut().selected = Some(target.item);
+        });
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+
+        // Drafts live only in the tab, so closing one throws the edits away.
+        // Saying so is the least that is owed until there is a real prompt.
+        if self.tabs[index].read(cx).is_dirty {
+            self.status_message = Some("Closed tab — unsaved changes discarded".to_string());
+        }
+        self.tabs.remove(index);
+
+        self.active = match self.active {
+            _ if self.tabs.is_empty() => None,
+            Some(active) if active > index => Some(active - 1),
+            Some(active) if active == index => Some(index.min(self.tabs.len() - 1)),
+            other => other,
+        };
+        if let Some(active) = self.active {
+            self.activate_tab(active, cx);
+        }
+        cx.notify();
+    }
+
+    /// Writes the active tab's draft into the document and out to its own file.
+    fn save_active_tab(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        let Some(tab) = self.active_tab().cloned() else {
+            return Err(anyhow!("no request open"));
+        };
+
+        let target = tab.read(cx).target.clone();
+        let draft = tab.read(cx).draft(cx);
+
+        let saved = draft.clone();
+        self.collections.update(cx, |store, _| {
+            let collection = store
+                .collection_mut(target.collection)
+                .ok_or_else(|| anyhow!("this collection is no longer open"))?;
+            let request = collection
+                .request_at_mut(&target.item)
+                .ok_or_else(|| anyhow!("the request this tab was editing is gone"))?;
+            request.http = Some(saved);
+            collection.save_item(&target.item)
+        })?;
+
+        tab.update(cx, |tab, cx| tab.mark_saved(draft, cx));
+        self.status_message = Some("Saved request".to_string());
+        Ok(())
+    }
+
+    /// Throws the active tab's draft away and shows the request as saved.
+    fn revert_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab().cloned() else {
+            return;
+        };
+        let target = tab.read(cx).target.clone();
+        let Some(saved) = self
+            .collections
+            .read(cx)
+            .collection(target.collection)
+            .and_then(|collection| collection.request_at(&target.item))
+            .map(|request| request.http.clone().unwrap_or_default())
+        else {
+            return;
+        };
+
+        tab.update(cx, |tab, cx| tab.reset_to(saved, window, cx));
+        self.status_message = Some("Reverted to last saved".to_string());
+        cx.notify();
     }
 
     fn on_collection_event(
         &mut self,
         _: &Entity<CollectionStore>,
-        event: &CollectionEvent,
-        window: &mut Window,
+        _: &CollectionEvent,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match event {
-            CollectionEvent::ActiveChanged => {
-                self.response = None;
-                self.load_selected_draft(window, cx);
-            }
-            CollectionEvent::RequestsChanged => self.load_selected_draft(window, cx),
-        }
         cx.notify();
     }
 
     fn switch_collection(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.is_dirty {
-            let _ = self.save_selected(cx);
-        }
         self.collections.update(cx, |store, cx| {
             store.set_active(index);
             cx.emit(CollectionEvent::ActiveChanged);
         });
+        // Tabs hold their own drafts, so nothing needs flushing here; the tab
+        // bar simply keeps showing every open request.
+        cx.notify();
     }
 
     /// Asks for a location, then creates a collection directory there.
@@ -190,9 +219,6 @@ impl WorkspaceScreen {
                 return;
             };
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.is_dirty {
-                    let _ = this.save_selected(cx);
-                }
                 let result = this.collections.update(cx, |store, _| store.create(&root));
                 this.after_collection_change(result, "Created collection", window, cx);
             });
@@ -216,9 +242,6 @@ impl WorkspaceScreen {
                 return;
             };
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.is_dirty {
-                    let _ = this.save_selected(cx);
-                }
                 let result = this.collections.update(cx, |store, _| store.open(&root));
                 this.after_collection_change(result, "Opened collection", window, cx);
             });
@@ -228,15 +251,16 @@ impl WorkspaceScreen {
 
     fn after_collection_change(
         &mut self,
-        result: anyhow::Result<()>,
+        result: Result<()>,
         success_message: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match result {
             Ok(()) => {
-                self.response = None;
-                self.load_selected_draft(window, cx);
+                if let Some(target) = self.selected_target(cx) {
+                    self.open_tab(target, window, cx);
+                }
                 self.status_message = Some(success_message.to_string());
             }
             Err(error) => self.status_message = Some(error.to_string()),
@@ -244,90 +268,78 @@ impl WorkspaceScreen {
         cx.notify();
     }
 
-    fn select_request(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_dirty {
-            let _ = self.save_selected(cx);
-        }
-        self.collections.update(cx, |store, _| {
-            store.active_mut().select(path);
-        });
-        self.response = None;
-        self.load_selected_draft(window, cx);
-        cx.notify();
-    }
-
-    fn load_selected_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let selected = self
-            .collections
-            .read(cx)
-            .active()
-            .selected_request()
-            .map(|request| (request.draft.clone(), request.parse_error.clone()));
-
-        match selected {
-            Some((draft, parse_error)) => {
-                self.draft = draft;
-                self.status_message = parse_error;
-            }
-            None => self.draft = RequestDraft::default(),
-        }
-        self.is_dirty = false;
-        self.sync_inputs_from_draft(window, cx);
-    }
-
-    fn save_selected(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
-        let draft = self.draft.clone();
-        self.collections
-            .update(cx, |store, _| store.active_mut().save_selected(&draft))?;
-        self.is_dirty = false;
-        self.status_message = Some("Saved request".to_string());
-        Ok(())
+    fn select_request(&mut self, path: ItemPath, window: &mut Window, cx: &mut Context<Self>) {
+        let collection = self.collections.read(cx).active_index();
+        self.open_tab(
+            TabTarget {
+                collection,
+                item: path,
+            },
+            window,
+            cx,
+        );
     }
 
     fn create_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let created = self.collections.update(cx, |store, _| {
-            store.active_mut().create_request("New request")
+        self.collections.update(cx, |store, _| {
+            store.active_mut().create_request("New request");
         });
-
-        match created {
-            Ok(_) => {
-                self.load_selected_draft(window, cx);
-                self.status_message = Some("Created request".to_string());
-            }
-            Err(error) => self.status_message = Some(error.to_string()),
+        if let Some(target) = self.selected_target(cx) {
+            self.open_tab(target, window, cx);
         }
+        self.status_message = Some("Created request".to_string());
         cx.notify();
     }
 
-    fn send_selected(&mut self, cx: &mut Context<Self>) {
-        self.is_sending = true;
-        self.response = None;
-        self.response_body_pretty = true;
+    /// Sends what the user is looking at — the draft, not the saved request.
+    fn send_active_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab().cloned() else {
+            self.status_message = Some("No request open".to_string());
+            cx.notify();
+            return;
+        };
+
+        let target = tab.read(cx).target.clone();
+        let draft = tab.read(cx).draft(cx);
+        let mut request = self
+            .collections
+            .read(cx)
+            .collection(target.collection)
+            .and_then(|collection| collection.request_at(&target.item))
+            .cloned()
+            .unwrap_or_else(|| HttpRequest::get(""));
+        request.http = Some(draft);
+
+        tab.update(cx, |tab, cx| {
+            tab.is_sending = true;
+            tab.response = None;
+            tab.response_body_pretty = true;
+            cx.notify();
+        });
         self.status_message = Some("Sending request".to_string());
         let client = self.http_client.clone();
-        let draft = self.draft.clone();
 
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { http_client::send_request(client, draft) })
+                .background_spawn(async move { http_client::send_request(client, request) })
                 .await;
 
             let _ = this.update(cx, |this, cx| {
-                this.is_sending = false;
-                match result {
-                    Ok(response) => {
-                        this.status_message = Some(format!(
-                            "{} {} in {} ms",
-                            response.status,
-                            response.status_text,
-                            response.duration_ms()
-                        ));
-                        this.response = Some(response);
-                    }
-                    Err(error) => {
-                        this.status_message = Some(error.to_string());
-                    }
-                }
+                let message = match &result {
+                    Ok(response) => format!(
+                        "{} {} in {} ms",
+                        response.status,
+                        response.status_text,
+                        response.duration_ms()
+                    ),
+                    Err(error) => error.to_string(),
+                };
+                tab.update(cx, |tab, cx| {
+                    tab.is_sending = false;
+                    tab.response = result.ok();
+                    cx.notify();
+                });
+                this.status_message = Some(message);
                 cx.notify();
             });
         })
@@ -336,118 +348,73 @@ impl WorkspaceScreen {
         cx.notify();
     }
 
-    fn on_url_input(
-        this: &mut Self,
-        state: &Entity<InputState>,
-        event: &InputEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if matches!(event, InputEvent::Change) {
-            this.draft.url = state.read(cx).value().to_string();
-            this.is_dirty = true;
-            cx.notify();
-        }
-    }
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let tab = tab.read(cx);
+                (index, tab.title.clone(), tab.is_dirty)
+            })
+            .collect::<Vec<_>>();
 
-    fn on_method_select(
-        this: &mut Self,
-        _: &Entity<SelectState<Vec<SharedString>>>,
-        event: &SelectEvent<Vec<SharedString>>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let SelectEvent::Confirm(Some(value)) = event
-            && let Ok(method) = value.as_ref().parse::<HttpMethod>()
-        {
-            this.draft.method = method;
-            this.is_dirty = true;
-            cx.notify();
-        }
-    }
-
-    fn on_headers_input(
-        this: &mut Self,
-        state: &Entity<InputState>,
-        event: &InputEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if matches!(event, InputEvent::Change) {
-            this.draft.headers = parse_rows(&state.read(cx).value());
-            this.is_dirty = true;
-            cx.notify();
-        }
-    }
-
-    fn on_params_input(
-        this: &mut Self,
-        state: &Entity<InputState>,
-        event: &InputEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if matches!(event, InputEvent::Change) {
-            this.draft.params = parse_rows(&state.read(cx).value());
-            this.is_dirty = true;
-            cx.notify();
-        }
-    }
-
-    fn on_body_input(
-        this: &mut Self,
-        state: &Entity<InputState>,
-        event: &InputEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if matches!(event, InputEvent::Change) {
-            this.draft.body = BodyMode::from_editor_text(state.read(cx).value().to_string());
-            this.is_dirty = true;
-            cx.notify();
-        }
-    }
-
-    fn sync_inputs_from_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.method_select.update(cx, |state, cx| {
-            state.set_selected_value(&SharedString::from(self.draft.method.as_str()), window, cx);
-        });
-        self.url_input.update(cx, |state, cx| {
-            state.set_value(self.draft.url.clone(), window, cx);
-        });
-        self.headers_input.update(cx, |state, cx| {
-            state.set_value(format_rows(&self.draft.headers), window, cx);
-        });
-        self.params_input.update(cx, |state, cx| {
-            state.set_value(format_rows(&self.draft.params), window, cx);
-        });
-        self.body_input.update(cx, |state, cx| {
-            state.set_highlighter(self.draft.body.language(), cx);
-            state.set_value(self.draft.body.text().to_string(), window, cx);
-        });
+        h_flex()
+            .w_full()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                TabBar::new("request-tab-bar")
+                    .w_full()
+                    .selected_index(self.active.unwrap_or(0))
+                    .on_click(cx.listener(|this, index: &usize, _, cx| {
+                        this.activate_tab(*index, cx);
+                    }))
+                    .children(tabs.into_iter().map(|(index, title, is_dirty)| {
+                        Tab::new()
+                            .label(title)
+                            // A leading dot marks the unsaved draft, the way an
+                            // editor marks a modified buffer. It goes before the
+                            // label so a long request name cannot push it out of
+                            // view, and the close button stays put either way —
+                            // a dirty tab still has to be closable.
+                            .when(is_dirty, |tab| {
+                                tab.prefix(div().text_color(orange_300()).child("●"))
+                            })
+                            .suffix(
+                                Button::new(SharedString::from(format!("close-tab-{index}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Close)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.close_tab(index, cx);
+                                    })),
+                            )
+                    })),
+            )
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let store = self.collections.read(cx);
         let active_index = store.active_index();
-        let collection_name = store.active().name.clone();
+        let collection_name = store.active().name();
         let switcher_items = store
             .collections()
             .iter()
             .enumerate()
-            .map(|(index, collection)| (index, collection.name.clone()))
+            .map(|(index, collection)| (index, collection.name()))
             .collect::<Vec<_>>();
         let requests = store
             .active()
-            .requests
-            .iter()
-            .map(|request| {
-                (
-                    request.path.clone(),
-                    request.relative_path.clone(),
-                    request.draft.name.clone(),
-                    request.draft.method,
-                )
+            .requests()
+            .into_iter()
+            .map(|(path, request)| {
+                let method = request
+                    .http
+                    .as_ref()
+                    .and_then(|details| details.method.clone())
+                    .unwrap_or_else(|| "GET".to_string());
+                (path, request_name(request), method)
             })
             .collect::<Vec<_>>();
         let selected_path = store.active().selected.clone();
@@ -524,40 +491,53 @@ impl WorkspaceScreen {
                             })),
                     ),
             )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .overflow_y_scrollbar()
-                    .p_2()
-                    .children(
-                        requests
-                            .into_iter()
-                            .map(|(path, relative_path, name, method)| {
-                                let selected = Some(&path) == selected_path.as_ref();
+            .child(v_flex().flex_1().overflow_y_scrollbar().p_2().children(
+                requests.into_iter().map(|(path, name, method)| {
+                    let selected = Some(&path) == selected_path.as_ref();
 
-                                h_flex()
-                                    .id(format!("request-{}", relative_path.display()))
-                                    .px_2()
-                                    .py_1()
-                                    .justify_between()
-                                    .rounded_sm()
-                                    .when(selected, |el| el.bg(cx.theme().button_active))
-                                    .hover(|style| style.bg(cx.theme().button_hover))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.select_request(path.clone(), window, cx);
-                                    }))
-                                    .child(name)
-                                    .child(
-                                        Label::new(method.to_string())
-                                            .text_color(method_color(&method)),
-                                    )
-                            }),
-                    ),
-            )
+                    h_flex()
+                        .id(SharedString::from(format!("request-{path:?}")))
+                        .px_2()
+                        .py_1()
+                        .justify_between()
+                        .rounded_sm()
+                        .when(selected, |el| el.bg(cx.theme().button_active))
+                        .hover(|style| style.bg(cx.theme().button_hover))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_request(path.clone(), window, cx);
+                        }))
+                        .child(name)
+                        .child(Label::new(method.clone()).text_color(method_color(&method)))
+                }),
+            ))
     }
 
-    fn render_request_editor(&self, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+    fn render_request_editor(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(tab) = self.active_tab().cloned() else {
+            return v_flex()
+                .flex_1()
+                .flex_basis(relative(0.))
+                .min_h(px(0.))
+                .items_center()
+                .justify_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .text_color(cx.theme().muted_foreground)
+                .child("Select a request to start editing")
+                .into_any_element();
+        };
+
+        // Cloned out rather than borrowed: rendering the panes needs `cx`
+        // mutably, and the entity handles are cheap to clone.
         let save_target = cx.entity().downgrade();
+        let state = tab.read(cx);
+        let pane = state.pane;
+        let is_sending = state.is_sending;
+        let method_select = state.method_select.clone();
+        let url_input = state.url_input.clone();
+        let headers_input = state.headers_input.clone();
+        let params_input = state.params_input.clone();
+        let body_input = state.body_input.clone();
 
         v_flex()
             .flex_1()
@@ -581,7 +561,7 @@ impl WorkspaceScreen {
                             .bg(cx.theme().background)
                             .child(
                                 div().w(px(140.)).child(
-                                    Select::new(&self.method_select)
+                                    Select::new(&method_select)
                                         .appearance(false)
                                         .placeholder("Method"),
                                 ),
@@ -590,7 +570,7 @@ impl WorkspaceScreen {
                             .child(
                                 div()
                                     .flex_1()
-                                    .child(Input::new(&self.url_input).appearance(false)),
+                                    .child(Input::new(&url_input).appearance(false)),
                             )
                             .child(Separator::vertical())
                             .child(
@@ -600,12 +580,13 @@ impl WorkspaceScreen {
                                         .ghost()
                                         .button(Button::new("send-request").label("Send").on_click(
                                             cx.listener(|this, _, _, cx| {
-                                                this.send_selected(cx);
+                                                this.send_active_tab(cx);
                                             }),
                                         ))
-                                        .loading(self.is_sending)
+                                        .loading(is_sending)
                                         .dropdown_menu(move |menu, _, _| {
                                             let save_target = save_target.clone();
+                                            let revert_target = save_target.clone();
                                             menu.label("Request")
                                                 .separator()
                                                 .item(PopupMenuItem::new("Save").on_click(
@@ -613,7 +594,7 @@ impl WorkspaceScreen {
                                                         let _ =
                                                             save_target.update(cx, |this, cx| {
                                                                 if let Err(error) =
-                                                                    this.save_selected(cx)
+                                                                    this.save_active_tab(cx)
                                                                 {
                                                                     this.status_message =
                                                                         Some(error.to_string());
@@ -622,11 +603,21 @@ impl WorkspaceScreen {
                                                             });
                                                     },
                                                 ))
-                                                .item(PopupMenuItem::new("Save as").disabled(true))
                                                 .item(
-                                                    PopupMenuItem::new("Duplicate request")
-                                                        .disabled(true),
+                                                    PopupMenuItem::new("Revert to saved").on_click(
+                                                        move |_, window, cx| {
+                                                            let _ = revert_target.update(
+                                                                cx,
+                                                                |this, cx| {
+                                                                    this.revert_active_tab(
+                                                                        window, cx,
+                                                                    );
+                                                                },
+                                                            );
+                                                        },
+                                                    ),
                                                 )
+                                                .item(PopupMenuItem::new("Save as").disabled(true))
                                         }),
                                 ),
                             ),
@@ -639,49 +630,51 @@ impl WorkspaceScreen {
                     .p_3()
                     .gap_3()
                     .child(
-                        TabBar::new("request-tabs")
+                        TabBar::new("request-panes")
                             .segmented()
-                            .selected_index(self.request_tab.index())
-                            .on_click(cx.listener(|this, index, _, cx| {
-                                this.request_tab = match *index {
-                                    1 => RequestTab::Params,
-                                    2 => RequestTab::Body,
-                                    _ => RequestTab::Headers,
-                                };
-                                cx.notify();
+                            .selected_index(pane.index())
+                            .on_click(cx.listener(|this, index: &usize, _, cx| {
+                                let pane = RequestPane::from_index(*index);
+                                if let Some(tab) = this.active_tab().cloned() {
+                                    tab.update(cx, |tab, cx| {
+                                        tab.pane = pane;
+                                        cx.notify();
+                                    });
+                                }
                             }))
                             .child(Tab::new().label("Headers"))
                             .child(Tab::new().label("Params"))
                             .child(Tab::new().label("Body")),
                     )
-                    .child(match self.request_tab {
-                        RequestTab::Headers => self.render_editor_textarea(
+                    .child(match pane {
+                        RequestPane::Headers => self.render_editor_textarea(
                             "Headers",
                             "One header per line, written as Name: value",
-                            &self.headers_input,
+                            &headers_input,
                             cx,
                         ),
-                        RequestTab::Params => self.render_editor_textarea(
+                        RequestPane::Params => self.render_editor_textarea(
                             "Params",
                             "One query param per line, written as name: value",
-                            &self.params_input,
+                            &params_input,
                             cx,
                         ),
-                        RequestTab::Body => self.render_editor_textarea(
+                        RequestPane::Body => self.render_editor_textarea(
                             "Body",
                             "JSON is detected automatically, otherwise raw text is sent",
-                            &self.body_input,
+                            &body_input,
                             cx,
                         ),
                     }),
             )
+            .into_any_element()
     }
 
     fn render_editor_textarea(
         &self,
         title: &'static str,
         help: &'static str,
-        input: &Entity<InputState>,
+        input: &Entity<gpui_component::input::InputState>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         v_flex()
@@ -712,6 +705,11 @@ impl WorkspaceScreen {
         let status = self.status_message.clone().unwrap_or_else(|| {
             "OpenCollection v1: edit a request, save it to YAML, then send it".to_string()
         });
+        let tab = self.active_tab().cloned();
+        let pane = tab
+            .as_ref()
+            .map_or(ResponsePane::Body, |tab| tab.read(cx).response_pane);
+        let response = tab.as_ref().and_then(|tab| tab.read(cx).response.clone());
 
         v_flex()
             .flex_1()
@@ -724,16 +722,17 @@ impl WorkspaceScreen {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
-                        TabBar::new("response-tabs")
+                        TabBar::new("response-panes")
                             .segmented()
-                            .selected_index(self.response_tab.index())
-                            .on_click(cx.listener(|this, index, _, cx| {
-                                this.response_tab = match *index {
-                                    1 => ResponseTab::Headers,
-                                    2 => ResponseTab::Meta,
-                                    _ => ResponseTab::Body,
-                                };
-                                cx.notify();
+                            .selected_index(pane.index())
+                            .on_click(cx.listener(|this, index: &usize, _, cx| {
+                                let pane = ResponsePane::from_index(*index);
+                                if let Some(tab) = this.active_tab().cloned() {
+                                    tab.update(cx, |tab, cx| {
+                                        tab.response_pane = pane;
+                                        cx.notify();
+                                    });
+                                }
                             }))
                             .child(Tab::new().label("Body"))
                             .child(Tab::new().label("Headers"))
@@ -746,16 +745,22 @@ impl WorkspaceScreen {
                             .child(status),
                     ),
             )
-            .child(div().flex_1().child(div().size_full().p_3().child(
-                match (&self.response, self.response_tab) {
-                    (Some(response), ResponseTab::Body) => self.render_response_body(response, cx),
-                    (Some(response), ResponseTab::Headers) => {
-                        self.render_response_headers(response, cx)
-                    }
-                    (Some(response), ResponseTab::Meta) => self.render_response_meta(response, cx),
-                    (None, _) => code_block("No response yet.".to_string(), cx),
-                },
-            )))
+            .child(
+                div()
+                    .flex_1()
+                    .child(div().size_full().p_3().child(match (&response, pane) {
+                        (Some(response), ResponsePane::Body) => {
+                            self.render_response_body(response, cx)
+                        }
+                        (Some(response), ResponsePane::Headers) => {
+                            self.render_response_headers(response, cx)
+                        }
+                        (Some(response), ResponsePane::Meta) => {
+                            self.render_response_meta(response, cx)
+                        }
+                        (None, _) => code_block("No response yet.".to_string(), cx),
+                    })),
+            )
     }
 
     fn render_response_body(
@@ -763,7 +768,10 @@ impl WorkspaceScreen {
         response: &ResponseRecord,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let text = if self.response_body_pretty {
+        let pretty = self
+            .active_tab()
+            .is_none_or(|tab| tab.read(cx).response_body_pretty);
+        let text = if pretty {
             response.pretty_body.clone()
         } else {
             response.body.clone()
@@ -773,11 +781,7 @@ impl WorkspaceScreen {
         } else {
             text.clone()
         };
-        let mode = if self.response_body_pretty {
-            "Pretty"
-        } else {
-            "Raw"
-        };
+        let mode = if pretty { "Pretty" } else { "Raw" };
 
         v_flex()
             .flex_1()
@@ -796,16 +800,21 @@ impl WorkspaceScreen {
                                     .child(
                                         Button::new("response-body-pretty")
                                             .label("Pretty")
-                                            .selected(self.response_body_pretty),
+                                            .selected(pretty),
                                     )
                                     .child(
                                         Button::new("response-body-raw")
                                             .label("Raw")
-                                            .selected(!self.response_body_pretty),
+                                            .selected(!pretty),
                                     )
                                     .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
-                                        this.response_body_pretty = !selected.contains(&1);
-                                        cx.notify();
+                                        let pretty = !selected.contains(&1);
+                                        if let Some(tab) = this.active_tab().cloned() {
+                                            tab.update(cx, |tab, cx| {
+                                                tab.response_body_pretty = pretty;
+                                                cx.notify();
+                                            });
+                                        }
                                     })),
                             )
                             .child(
@@ -837,7 +846,7 @@ impl WorkspaceScreen {
         response: &ResponseRecord,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let header_text = format_rows(&response.headers);
+        let header_text = format_response_headers(&response.headers);
 
         v_flex()
             .flex_1()
@@ -890,7 +899,7 @@ impl WorkspaceScreen {
                                             .font_family(JETBRAINS_MONO)
                                             .text_sm()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child(row.key.clone()),
+                                            .child(row.name.clone()),
                                     )
                                     .child(
                                         div()
@@ -975,10 +984,19 @@ impl Render for WorkspaceScreen {
                     .h_full()
                     .min_h(px(0.))
                     .min_w(px(480.))
+                    .child(self.render_tab_bar(cx))
                     .child(self.render_request_editor(cx))
                     .child(self.render_response(cx)),
             )
     }
+}
+
+fn request_name(request: &HttpRequest) -> String {
+    request
+        .info
+        .as_ref()
+        .and_then(|info| info.name.clone())
+        .unwrap_or_else(|| "Untitled".to_string())
 }
 
 fn code_block(text: String, cx: &mut Context<WorkspaceScreen>) -> gpui::AnyElement {
@@ -994,47 +1012,17 @@ fn code_block(text: String, cx: &mut Context<WorkspaceScreen>) -> gpui::AnyEleme
         .into_any_element()
 }
 
-fn method_color(method: &HttpMethod) -> Hsla {
-    match method {
-        HttpMethod::Get => green_300(),
-        HttpMethod::Post => orange_300(),
-        HttpMethod::Put => orange_300(),
-        HttpMethod::Patch => orange_300(),
-        HttpMethod::Delete => red_300(),
-        HttpMethod::Head => blue_300(),
-        HttpMethod::Options => blue_300(),
+fn method_color(method: &str) -> Hsla {
+    match method.to_ascii_uppercase().as_str() {
+        "GET" => green_300(),
+        "POST" | "PUT" | "PATCH" => orange_300(),
+        "DELETE" => red_300(),
+        _ => blue_300(),
     }
 }
 
-fn parse_rows(value: &SharedString) -> Vec<KeyValueRow> {
-    value
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            let (key, value) = line.split_once(':').unwrap_or((line, ""));
-            Some(KeyValueRow {
-                enabled: true,
-                key: key.trim().to_string(),
-                value: value.trim().to_string(),
-            })
-        })
-        .collect()
-}
-
-fn format_rows(rows: &[KeyValueRow]) -> String {
-    rows.iter()
-        .filter(|row| row.enabled && !row.key.trim().is_empty())
-        .map(|row| format!("{}: {}", row.key, row.value))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-#[allow(dead_code)]
-fn _duration_for_tests() -> Duration {
-    Duration::from_millis(0)
+fn format_response_headers(headers: &[HttpResponseHeader]) -> String {
+    join_lines(headers.iter().map(|header| (&header.name, &header.value)))
 }
 
 /// Where the native file picker opens by default.
