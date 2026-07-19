@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::{Result, anyhow};
 use gpui::{
@@ -7,9 +8,10 @@ use gpui::{
     prelude::FluentBuilder, px, relative,
 };
 use gpui_component::{
-    ActiveTheme, IconName, Selectable, Sizable, StyledExt, blue_300,
-    button::{Button, ButtonGroup, ButtonVariants, DropdownButton},
+    ActiveTheme, IconName, Selectable, Sizable, StyledExt, WindowExt, blue_300,
+    button::{Button, ButtonGroup, ButtonVariant, ButtonVariants, DropdownButton},
     clipboard::Clipboard,
+    dialog::DialogButtonProps,
     green_300, h_flex,
     input::Input,
     label::Label,
@@ -45,9 +47,10 @@ pub struct WorkspaceScreen {
     collections: Entity<CollectionStore>,
     /// The open tabs, each holding its own draft.
     ///
-    /// Because a tab owns the editors it is being edited in, switching tabs —
-    /// or collections — no longer has to flush anything to disk: an unsaved
-    /// draft simply stays in the tab it belongs to.
+    /// All of them belong to the active collection: leaving a collection closes
+    /// its tabs, so a tab can never point into one that is not on screen.
+    /// Switching between these tabs still costs nothing, since each owns the
+    /// editors it is being edited in and nothing has to be flushed to disk.
     tabs: Vec<Entity<RequestTab>>,
     active: Option<usize>,
     status_message: Option<String>,
@@ -272,18 +275,82 @@ impl WorkspaceScreen {
         cx.notify();
     }
 
-    fn switch_collection(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.collections.update(cx, |store, cx| {
-            store.set_active(index);
-            cx.emit(CollectionEvent::ActiveChanged);
+    /// Runs `proceed` unless open tabs would lose edits, in which case it asks.
+    ///
+    /// Every path that leaves a collection goes through here, because a tab may
+    /// only ever belong to the active collection: leaving one closes its tabs,
+    /// and a draft lives nowhere but the tab holding it.
+    fn confirm_leaving_collection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        proceed: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if !self.tabs.iter().any(|tab| tab.read(cx).is_dirty) {
+            proceed(self, window, cx);
+            return;
+        }
+
+        let this = cx.entity().downgrade();
+        let proceed = Rc::new(proceed);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let this = this.clone();
+            let proceed = proceed.clone();
+            alert
+                .title("Unsaved changes")
+                .description(
+                    "Leaving this collection closes every open tab. \
+                     Requests with unsaved changes will lose them.",
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Discard changes")
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text("Cancel")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    let _ = this.update(cx, |this, cx| proceed(this, window, cx));
+                    true
+                })
         });
-        // Tabs hold their own drafts, so nothing needs flushing here; the tab
-        // bar simply keeps showing every open request.
-        cx.notify();
+    }
+
+    /// Drops every tab, discarding whatever drafts they were holding.
+    fn close_all_tabs(&mut self) {
+        self.tabs.clear();
+        self.active = None;
+    }
+
+    fn switch_collection(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.collections.read(cx).active_index() == index {
+            return;
+        }
+
+        self.confirm_leaving_collection(window, cx, move |this, window, cx| {
+            this.close_all_tabs();
+            this.collections.update(cx, |store, cx| {
+                store.set_active(index);
+                cx.emit(CollectionEvent::ActiveChanged);
+            });
+            if let Some(target) = this.selected_target(cx) {
+                this.open_tab(target, window, cx);
+            }
+            cx.notify();
+        });
     }
 
     /// Asks for a location, then creates a collection directory there.
+    ///
+    /// The prompt comes before the file picker: once the store has opened the
+    /// new collection there is no switch left to cancel.
     fn create_collection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_leaving_collection(window, cx, |this, window, cx| {
+            this.pick_new_collection_path(window, cx);
+        });
+    }
+
+    fn pick_new_collection_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_new_path(&picker_start_dir(), Some("my-collection"));
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(root))) = receiver.await else {
@@ -299,6 +366,12 @@ impl WorkspaceScreen {
 
     /// Asks for an existing collection directory and opens it.
     fn open_collection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_leaving_collection(window, cx, |this, window, cx| {
+            this.pick_collection_to_open(window, cx);
+        });
+    }
+
+    fn pick_collection_to_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -329,6 +402,9 @@ impl WorkspaceScreen {
     ) {
         match result {
             Ok(()) => {
+                // The store has switched to the new collection, so the old
+                // collection's tabs would now point outside it.
+                self.close_all_tabs();
                 if let Some(target) = self.selected_target(cx) {
                     self.open_tab(target, window, cx);
                 }
@@ -525,9 +601,11 @@ impl WorkspaceScreen {
                                             menu = menu.item(
                                                 PopupMenuItem::new(name)
                                                     .checked(index == active_index)
-                                                    .on_click(move |_, _, cx| {
+                                                    .on_click(move |_, window, cx| {
                                                         switch_target.update(cx, |this, cx| {
-                                                            this.switch_collection(index, cx);
+                                                            this.switch_collection(
+                                                                index, window, cx,
+                                                            );
                                                         });
                                                     }),
                                             );
