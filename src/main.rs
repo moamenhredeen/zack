@@ -18,6 +18,17 @@ fn main() {
     app.run(move |cx| {
         gpui_component::init(cx);
         fonts::register(cx).expect("failed to register JetBrains Mono");
+
+        // Scoped to the workspace rather than bound globally, so the settings
+        // page cannot swallow a Cmd-S that has nothing to save.
+        cx.bind_keys([
+            KeyBinding::new("cmd-s", workspace::SaveTab, Some(workspace::KEY_CONTEXT)),
+            KeyBinding::new(
+                "cmd-alt-s",
+                workspace::SaveAll,
+                Some(workspace::KEY_CONTEXT),
+            ),
+        ]);
         {
             let theme = Theme::global_mut(cx);
             theme.font_family = JETBRAINS_MONO.into();

@@ -7,7 +7,19 @@ use gpui::{
     prelude::FluentBuilder, px, relative,
 };
 use gpui_component::{
-    ActiveTheme, IconName, Selectable, Sizable, StyledExt, blue_300, button::{Button, ButtonGroup, ButtonVariants, DropdownButton}, clipboard::Clipboard, green_300, h_flex, input::Input, label::Label, menu::PopupMenuItem, orange_300, red_300, scroll::ScrollableElement, select::Select, separator::Separator, tab::{Tab, TabBar}, v_flex,
+    ActiveTheme, IconName, Selectable, Sizable, StyledExt, blue_300,
+    button::{Button, ButtonGroup, ButtonVariants, DropdownButton},
+    clipboard::Clipboard,
+    green_300, h_flex,
+    input::Input,
+    label::Label,
+    menu::PopupMenuItem,
+    orange_300, red_300,
+    scroll::ScrollableElement,
+    select::Select,
+    separator::Separator,
+    tab::{Tab, TabBar},
+    v_flex,
 };
 
 use opencollection::{HttpRequest, HttpResponseHeader};
@@ -20,7 +32,16 @@ use crate::{
     request_tab::{RequestPane, RequestTab, ResponsePane, TabDirtied, TabTarget, join_lines},
 };
 
+gpui::actions!(zack, [SaveTab, SaveAll]);
+
+/// The key context the save bindings are scoped to.
+///
+/// gpui dispatches actions up the focus chain, so this name has to appear on
+/// the workspace's root element for the bindings in `main` to reach it.
+pub const KEY_CONTEXT: &str = "Workspace";
+
 pub struct WorkspaceScreen {
+    focus_handle: gpui::FocusHandle,
     collections: Entity<CollectionStore>,
     /// The open tabs, each holding its own draft.
     ///
@@ -43,6 +64,7 @@ impl WorkspaceScreen {
             .detach();
 
         let mut this = Self {
+            focus_handle: cx.focus_handle(),
             collections,
             tabs: Vec::new(),
             active: None,
@@ -95,6 +117,10 @@ impl WorkspaceScreen {
             return;
         };
 
+        // Without focus somewhere inside the workspace, the save bindings have
+        // no dispatch path and Cmd-S does nothing until the user clicks a field.
+        window.focus(&self.focus_handle, cx);
+
         let tab = cx.new(|cx| RequestTab::new(target, title, saved, window, cx));
         // A tab going dirty changes the tab bar, which the workspace draws.
         cx.subscribe(&tab, |_, _, _: &TabDirtied, cx| cx.notify())
@@ -146,7 +172,20 @@ impl WorkspaceScreen {
 
     /// Writes the active tab's draft into the document and out to its own file.
     fn save_active_tab(&mut self, cx: &mut Context<Self>) -> Result<()> {
-        let Some(tab) = self.active_tab().cloned() else {
+        let Some(index) = self.active else {
+            return Err(anyhow!("no request open"));
+        };
+        self.save_tab(index, cx)?;
+        self.status_message = Some("Saved request".to_string());
+        Ok(())
+    }
+
+    /// Writes one tab's draft into the document and out to its own file.
+    ///
+    /// Only the tab's own file is touched, so saving one tab cannot disturb the
+    /// unsaved drafts sitting in the others.
+    fn save_tab(&mut self, index: usize, cx: &mut Context<Self>) -> Result<()> {
+        let Some(tab) = self.tabs.get(index).cloned() else {
             return Err(anyhow!("no request open"));
         };
 
@@ -166,7 +205,39 @@ impl WorkspaceScreen {
         })?;
 
         tab.update(cx, |tab, cx| tab.mark_saved(draft, cx));
-        self.status_message = Some("Saved request".to_string());
+        Ok(())
+    }
+
+    /// Saves every tab that has unsaved changes, in tab order.
+    ///
+    /// Stops at the first failure rather than pressing on, so a collection that
+    /// has gone missing under us reports once, naming the request, instead of
+    /// once per tab.
+    fn save_all_tabs(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        let dirty: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.read(cx).is_dirty)
+            .map(|(index, _)| index)
+            .collect();
+
+        if dirty.is_empty() {
+            self.status_message = Some("No unsaved changes".to_string());
+            return Ok(());
+        }
+
+        let saved = dirty.len();
+        for index in dirty {
+            let title = self.tabs[index].read(cx).title.clone();
+            self.save_tab(index, cx)
+                .map_err(|error| anyhow!("{title}: {error}"))?;
+        }
+
+        self.status_message = Some(match saved {
+            1 => "Saved 1 request".to_string(),
+            n => format!("Saved {n} requests"),
+        });
         Ok(())
     }
 
@@ -978,6 +1049,20 @@ impl Render for WorkspaceScreen {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         h_flex()
             .size_full()
+            .track_focus(&self.focus_handle)
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(|this, _: &SaveTab, _, cx| {
+                if let Err(error) = this.save_active_tab(cx) {
+                    this.status_message = Some(error.to_string());
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SaveAll, _, cx| {
+                if let Err(error) = this.save_all_tabs(cx) {
+                    this.status_message = Some(error.to_string());
+                }
+                cx.notify();
+            }))
             .items_stretch()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
