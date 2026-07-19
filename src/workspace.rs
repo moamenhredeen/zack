@@ -7,7 +7,7 @@ use gpui::{
     prelude::FluentBuilder, px, relative,
 };
 use gpui_component::{
-    ActiveTheme, Edges, IconName, Selectable, Sizable, StyledExt, blue_300, button::{Button, ButtonGroup, ButtonVariants, DropdownButton}, clipboard::Clipboard, green_300, h_flex, input::Input, label::Label, menu::PopupMenuItem, orange_300, red_300, scroll::ScrollableElement, select::Select, separator::Separator, tab::{Tab, TabBar}, v_flex,
+    ActiveTheme, IconName, Selectable, Sizable, StyledExt, blue_300, button::{Button, ButtonGroup, ButtonVariants, DropdownButton}, clipboard::Clipboard, green_300, h_flex, input::Input, label::Label, menu::PopupMenuItem, orange_300, red_300, scroll::ScrollableElement, select::Select, separator::Separator, tab::{Tab, TabBar}, v_flex,
 };
 
 use opencollection::{HttpRequest, HttpResponseHeader};
@@ -372,6 +372,10 @@ impl WorkspaceScreen {
                     }))
                     .children(tabs.into_iter().map(|(index, title, is_dirty)| {
                         Tab::new()
+                            // Tab only pads its label; the prefix and suffix sit
+                            // outside that, flush against the tab's own borders.
+                            // Padding the tab itself covers all three.
+                            .px_2()
                             .label(title)
                             // A leading dot marks the unsaved draft, the way an
                             // editor marks a modified buffer. It goes before the
